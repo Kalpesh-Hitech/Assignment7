@@ -7,9 +7,10 @@ from models import RoleBased
 
 class UserCreate(BaseModel):
     username:str
+    name:Optional[str]=None
     email:str
     password:str
-    role:RoleBased
+    role:Optional[RoleBased]=RoleBased.STUDENT
     teacher_id:Optional[int]=None
     grade:Optional[str]=None
     created_by:Optional[int]=None

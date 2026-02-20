@@ -2,13 +2,14 @@ from typing import List
 
 from fastapi import Depends, HTTPException
 from fastapi.routing import APIRouter
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 from auth import create_access_token, get_current_user, hash_password, verify_password
 from models import Student, User
-from database import get_db
+from database import async_get_db, get_db
 from responseschemas import Adminresponse, Login, StudentResponse
 from requestschemas import LoginCrete, UpdateStudent, UserCreate
-
+from sqlalchemy.ext.asyncio import AsyncSession
 
 router = APIRouter()
 
@@ -51,78 +52,78 @@ def admin(
         db.add(db_user)
         db.commit()
         db.refresh(db_user)
-    if adminseed.role == "student":
-        if user.role != "admin" and user.role != "teacher":
-            raise HTTPException(status_code=401, detail="please enter the valid role!!")
-        if user.role == "teacher":
-            teacher_count = (
-                db.query(Student).filter(Student.created_by == user.id).count()
+    if user.role != "admin" and user.role != "teacher":
+        raise HTTPException(status_code=401, detail="please enter the valid role!!")
+    if user.role == "teacher":
+        teacher_count = (
+            db.query(Student).filter(Student.created_by == user.id).count()
+        )
+        if teacher_count > 30:
+            raise HTTPException(
+                status_code=402,
+                detail="aapke pass 30 student ho gaye hai abhi create nai kar sakate ho!!",
             )
-            if teacher_count > 30:
-                raise HTTPException(
-                    status_code=402,
-                    detail="aapke pass 30 student ho gaye hai abhi create nai kar sakate ho!!",
-                )
-            db_user = User(
-                username=adminseed.username, email=adminseed.email, role=adminseed.role
-            )
-            hashed_passedword = hash_password(adminseed.password)
+        db_user = User(
+            username=adminseed.username, email=adminseed.email, role="student"
+        )
+        hashed_passedword = hash_password(adminseed.password)
 
-            db_user.password = hashed_passedword
+        db_user.password = hashed_passedword
+        db.add(db_user)
+        db.flush()
+        new_student = Student(
+            name=adminseed.name,
+            grade=adminseed.grade,
+            created_by=user.id,
+            student_user_id=db_user.id,
+        )
+        # db_user.student.append(new_student)
+        db.add(new_student)
+        db.commit()
+        db.refresh(db_user)
+    if user.role == "admin":
+        db_user = User(
+            username=adminseed.username, email=adminseed.email, role=adminseed.role
+        )
+
+        hashed_passedword = hash_password(adminseed.password)
+
+        db_user.password = hashed_passedword
+
+        if adminseed.teacher_id != None:
+            db_teacher = (
+                db.query(User).filter(User.id == adminseed.teacher_id).first()
+            )
+            if not db_teacher:
+                raise HTTPException(
+                    status_code=404, detail="teacher ki id galat hai"
+                )
+            if db_teacher.role != "teacher":
+                raise HTTPException(
+                    status_code=404,
+                    detail="admin bhai role dekho bad me sahi id dalo",
+                )
             db.add(db_user)
             db.flush()
             new_student = Student(
-                name=adminseed.username,
+                name=adminseed.name,
                 grade=adminseed.grade,
-                created_by=user.id,
+                created_by=adminseed.teacher_id,
                 student_user_id=db_user.id,
             )
             # db_user.student.append(new_student)
-            db.add(new_student)
-            db.commit()
-            db.refresh(db_user)
-        if user.role == "admin":
-            db_user = User(
-                username=adminseed.username, email=adminseed.email, role=adminseed.role
+
+        else:
+            raise HTTPException(
+                status_code=404, detail="please provide the teacher id"
             )
-
-            hashed_passedword = hash_password(adminseed.password)
-
-            db_user.password = hashed_passedword
-
-            if adminseed.teacher_id != None:
-                db_teacher = (
-                    db.query(User).filter(User.id == adminseed.teacher_id).first()
-                )
-                if not db_teacher:
-                    raise HTTPException(
-                        status_code=404, detail="teacher ki id galat hai"
-                    )
-                if db_teacher.role != "teacher":
-                    raise HTTPException(
-                        status_code=404,
-                        detail="admin bhai role dekho bad me sahi id dalo",
-                    )
-                db.add(db_user)
-                db.flush()
-                new_student = Student(
-                    name=adminseed.username,
-                    grade=adminseed.grade,
-                    created_by=adminseed.teacher_id,
-                    student_user_id=db_user.id,
-                )
-                # db_user.student.append(new_student)
-
-            else:
-                raise HTTPException(
-                    status_code=404, detail="please provide the teacher id"
-                )
-            db.add(new_student)
-            db.commit()
-            db.refresh(db_user)
+        db.add(new_student)
+        db.commit()
+        db.refresh(db_user)
     return {
         "id": db_user.id,
         "username": adminseed.username,
+        "name": adminseed.name,
         "email": adminseed.email,
         "role": adminseed.role,
     }
@@ -140,33 +141,107 @@ def login(user: LoginCrete, db: Session = Depends(get_db)):
     return {"token": access_token}
 
 
-@router.get("/all_students", response_model=List[StudentResponse])
-def student_by_id(
-    user: User = Depends(get_current_user), db: Session = Depends(get_db)
+from sqlalchemy.orm import joinedload
+
+
+@router.get("/all_students", response_model=List[StudentResponse]|dict)
+async def student_by_id(
+    teacher:str|None=None,
+    teacher_id:int|None=None,
+    admins:str|None=None,
+    user: User = Depends(get_current_user), db: AsyncSession = Depends(async_get_db)
 ):
-    if user.role != "admin":
-        raise HTTPException(
-            status_code=401, detail="admin can access the all students!"
+    query=None
+    if user.role not in ["admin", "teacher"]:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if teacher=="teacher" and user.role=="admin":
+        query = select(User).where(User.role=="teacher")
+        result = await db.execute(query)
+        rows = result.scalars().all()
+        if not rows:
+            raise HTTPException(status_code=404, detail="No teachers found!")
+        response = []
+        for user_obj in rows:
+            response.append(
+                {
+                    "id": user_obj.id,
+                    "username": user_obj.username,
+                    "email": user_obj.email,
+                    "name":None,
+                    "grade":None,
+                    "created_by":None,
+                    "user_id":None
+                }
+            )
+        return response
+    if teacher_id and user.role=="admin":
+        query = select(Student,User).join(User,Student.student_user_id == User.id).where(Student.created_by == teacher_id)
+        result = await db.execute(query)
+        rows = result.all()
+        if not rows:
+            raise HTTPException(status_code=404, detail="No teachers found!")
+        response = []
+        for student_obj, user_obj in rows:
+            response.append(
+                {
+                    "id": student_obj.id,
+                    "user_id": student_obj.student_user_id,
+                    "username": user_obj.username,
+                    "email": user_obj.email,
+                    "name": student_obj.name,
+                    "grade": student_obj.grade,
+                    "created_by": student_obj.created_by,
+                }
+            )
+
+        return response
+    if admins=="admin" and user.role=="admin":
+        query = select(User).where(User.role=="admin")
+        result = await db.execute(query)
+        rows = result.scalars().all()
+        if not rows:
+            raise HTTPException(status_code=404, detail="No teachers found!")
+        response = []
+        for user_obj in rows:
+            response.append(
+                {
+                    "id": user_obj.id,
+                    "username": user_obj.username,
+                    "email": user_obj.email,
+                    "name":None,
+                    "grade":None,
+                    "created_by":None,
+                    "user_id":None
+                }
+            )
+
+        return response
+    query = select(Student, User).join(User, Student.student_user_id == User.id)
+
+    if user.role == "teacher":
+        query = query.where(Student.created_by == user.id)
+
+    result = await db.execute(query)
+    rows = result.all()
+
+    if not rows:
+        raise HTTPException(status_code=404, detail="No students found!")
+
+    response = []
+    for student_obj, user_obj in rows:
+        response.append(
+            {
+                "id": student_obj.id,
+                "user_id": student_obj.student_user_id,
+                "username": user_obj.username,
+                "email": user_obj.email,
+                "name": student_obj.name,
+                "grade": student_obj.grade,
+                "created_by": student_obj.created_by,
+            }
         )
-    db_students = db.query(Student).all()
 
-    if not db_students:
-        raise HTTPException(status_code=404, detail="nai hai students!!")
-    return db_students
-
-
-@router.get("/get_my_student", response_model=List[StudentResponse])
-def get_my_students(
-    user: User = Depends(get_current_user), db: Session = Depends(get_db)
-):
-    if user.role != "teacher":
-        raise HTTPException(
-            status_code=401, detail="teacher can access the their students!"
-        )
-    db_students = db.query(Student).filter(Student.created_by == user.id)
-    if not db_students:
-        raise HTTPException(status_code=404, detail="nai hai students!!")
-    return db_students
+    return response
 
 
 @router.post("/create-admin")
@@ -204,22 +279,95 @@ def teacher_student_id(
 
 
 @router.delete("/delete_student", response_model=dict)
-def delete_student(
+async def delete_student(
     student_user_id: int,
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(async_get_db),
 ):
     if current_user.role != "admin":
         raise HTTPException(status_code=403, detail="unauthorize access")
-    student_user = (
-        db.query(User)
-        .filter(User.id == student_user_id, User.role == "student")
-        .first()
-    )
+    query = select(User).where(User.id == student_user_id, User.role == "student")
+    result_user = await db.execute(query)
+    student_user = result_user.scalars().first()
     if not student_user:
         raise HTTPException(status_code=404, detail="student nhi h to kya delete kru")
 
-    db.delete(student_user)
-    db.commit()
+    await db.delete(student_user)
+    await db.commit()
 
     return {"message": "bhaga diya bhai"}
+@router.get("/myprofile", response_model=StudentResponse)
+async def get_my_profile(
+    user: User = Depends(get_current_user), 
+    db: AsyncSession = Depends(async_get_db)
+):
+    if user.role == "student":
+        query = select(Student, User).join(User, Student.student_user_id == User.id).where(User.id == user.id)
+        result = await db.execute(query)
+        row = result.first()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Student profile not found")
+
+        student_obj, user_obj = row
+        return {
+            "id": student_obj.id,
+            "user_id": student_obj.student_user_id,
+            "username": user_obj.username,
+            "email": user_obj.email,
+            "name": student_obj.name,
+            "grade": student_obj.grade,
+            "created_by": student_obj.created_by,
+        }
+
+    return {
+        "id": user.id,
+        "user_id": user.id,
+        "username": user.username,
+        "email": user.email,
+        "name": "Staff Member",
+        "grade": None,
+        "created_by": None,
+    }
+
+@router.post("/bulk_create_students")
+async def bulk_create_students(
+    students_data: List[UserCreate],
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(async_get_db)
+):
+    if user.role not in ["admin", "teacher"]:
+        raise HTTPException(status_code=401, detail="Sirf Admin/Teacher bulk insert kar sakte hain")
+    
+    try:
+        for data in students_data:
+            new_user = User(
+                username=data.username,
+                email=data.email,
+                password=hash_password(data.password),
+                role="student"
+            )
+            db.add(new_user)
+            await db.flush()
+            if user.role=="admin":
+                new_student = Student(
+                    name=data.name,
+                    grade=data.grade,
+                    created_by=data.teacher_id,
+                    student_user_id=new_user.id
+                )
+            else:
+                new_student = Student(
+                    name=data.name,
+                    grade=data.grade,
+                    created_by=user.id,
+                    student_user_id=new_user.id
+                )
+            db.add(new_student)
+        
+        await db.commit()
+        return {"message": f"Successfully created {len(students_data)} students!"}
+
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=f"Bulk creation fail ho gaya: {str(e)}")
